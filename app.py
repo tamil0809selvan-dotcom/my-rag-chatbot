@@ -1,10 +1,8 @@
-
 import os
 import io
 import time
+import base64
 import hashlib
-import wave
-
 import streamlit as st
 import faiss
 import numpy as np
@@ -14,9 +12,13 @@ from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from google import genai
 from google.genai import errors, types
+from streamlit_mic_recorder import mic_recorder
 
 
+# =========================================================
 # 1. CONFIGURATION
+# =========================================================
+
 load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
@@ -24,13 +26,66 @@ GEMINI_MODEL = "gemini-3.8-flash"
 TTS_MODEL = "gemini-3.8-flash-tts"
 
 st.set_page_config(
-    page_title="Advanced RAG Chatbot",
+    page_title="PDF Chat | RAG Assistant",
     page_icon="🤖",
     layout="centered",
 )
 
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: #0e1117;
+    }
 
+    .block-container {
+        max-width: 900px;
+        padding-top: 1.5rem;
+        padding-bottom: 4rem;
+    }
+
+    .hero {
+        padding: 1.2rem 1.4rem;
+        border: 1px solid #303644;
+        border-radius: 18px;
+        background: linear-gradient(135deg, #1c2230, #11141b);
+        margin-bottom: 1rem;
+    }
+
+    .muted {
+        color: #a6adbb;
+    }
+
+    div[data-testid="stFileUploader"] {
+        border: 1px dashed #50596a;
+        border-radius: 14px;
+        padding: .5rem;
+    }
+
+    div.stButton > button {
+        border-radius: 11px;
+        min-height: 2.5rem;
+    }
+
+    div[data-testid="stChatMessage"] {
+        border: 1px solid #292e39;
+        border-radius: 14px;
+        padding: .8rem;
+    }
+
+    div[data-testid="stAudio"] {
+        width: 100%;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# =========================================================
 # 2. SESSION STATE
+# =========================================================
+
 DEFAULTS = {
     "active_mode": None,
     "messages": [],
@@ -40,6 +95,12 @@ DEFAULTS = {
     "chunks": [],
     "faiss_index": None,
     "embedding_model": None,
+    "last_voice_hash": None,
+    "last_auto_pdf_hash": None,
+    "last_transcript": None,
+    "tts_audio": {},
+    "tts_errors": {},
+    "autoplay_audio_id": None,
 }
 
 for key, value in DEFAULTS.items():
@@ -49,20 +110,27 @@ for key, value in DEFAULTS.items():
 client = genai.Client(api_key=API_KEY) if API_KEY else None
 
 
+# =========================================================
 # 3. EMBEDDING MODEL
+# =========================================================
+
 @st.cache_resource
 def load_embedding_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 
-# 4. GEMINI TEXT RESPONSE
-def ask_gemini_with_retry(prompt, max_retries=3):
+# =========================================================
+# 4. GEMINI TEXT RESPONSE WITH RETRY
+# =========================================================
+
+def ask_gemini_with_retry(prompt, max_retries=5):
+
     if client is None:
         raise ValueError(
             "GEMINI_API_KEY missing. Check your .env file."
         )
 
-    retryable_codes = {500, 502, 503, 504}
+    retryable_codes = {429, 500, 502, 503, 504}
 
     for attempt in range(max_retries):
         try:
@@ -76,110 +144,172 @@ def ask_gemini_with_retry(prompt, max_retries=3):
                     "Gemini returned an empty response."
                 )
 
-            return response.text
+            return response.text.strip()
 
         except errors.APIError as error:
-            if error.code not in retryable_codes:
+            if (
+                error.code not in retryable_codes
+                or attempt == max_retries - 1
+            ):
                 raise
 
-            if attempt == max_retries - 1:
-                raise
+            wait_seconds = min(2 ** (attempt + 1), 20)
 
-            time.sleep(2 ** attempt)
+            st.warning(
+                f"Gemini temporarily busy ({error.code}). "
+                f"Retrying in {wait_seconds} seconds... "
+                f"({attempt + 1}/{max_retries - 1})"
+            )
 
-    raise RuntimeError("Gemini request failed.")
+            time.sleep(wait_seconds)
+
+    raise RuntimeError("Gemini request failed after retries.")
 
 
-# 5. VOICE INPUT: SPEECH TO TEXT
+# =========================================================
+# 5. VOICE INPUT: SPEECH TO TEXT WITH RETRY
+# =========================================================
+
 def transcribe_audio(audio_bytes, mime_type="audio/wav"):
+
     if client is None:
-        raise ValueError("Check your GEMINI_API_KEY in .env.")
-
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            (
-                "Transcribe the user's speech accurately. "
-                "The speech may be in Tamil, Tanglish "
-                "(Tamil spoken using English letters), "
-                "or English. Preserve the original language "
-                "and wording. Do not translate, answer the "
-                "question, or add explanations. Return only "
-                "the transcribed words."
-            ),
-            types.Part.from_bytes(
-                data=audio_bytes,
-                mime_type=mime_type,
-            ),
-        ],
-    )
-
-    transcript = (response.text or "").strip()
-
-    if not transcript:
         raise ValueError(
-            "Speech could not be converted to text. "
-            "Please record again."
+            "Check your GEMINI_API_KEY in .env."
         )
 
-    return transcript
+    retryable_codes = {429, 500, 502, 503, 504}
 
+    for attempt in range(5):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    (
+                        "Transcribe the user's speech accurately. "
+                        "The speech may be in Tamil, Tanglish "
+                        "(Tamil spoken using English letters), "
+                        "or English. Preserve the original language "
+                        "and wording. Do not translate, answer the "
+                        "question, or add explanations. Return only "
+                        "the transcribed words."
+                    ),
+                    types.Part.from_bytes(
+                        data=audio_bytes,
+                        mime_type=mime_type,
+                    ),
+                ],
+            )
 
-# 6. VOICE OUTPUT: TEXT TO SPEECH
-def text_to_speech(text):
-    if client is None:
-        raise ValueError("Check your GEMINI_API_KEY in .env.")
+            transcript = (response.text or "").strip()
 
-    response = client.models.generate_content(
-        model=TTS_MODEL,
-        contents=(
-            "Read the following assistant response naturally "
-            "and clearly. Use the language of the text. "
-            "If it contains Tamil, speak Tamil; if it contains "
-            "English, speak English. Do not translate it.\n\n"
-            + text[:4000]
-        ),
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Kore"
-                    )
+            if not transcript:
+                raise ValueError(
+                    "Speech could not be converted to text. "
+                    "Please record again."
                 )
-            ),
-        ),
+
+            return transcript
+
+        except errors.APIError as error:
+            if (
+                error.code not in retryable_codes
+                or attempt == 4
+            ):
+                raise
+
+            wait_seconds = min(2 ** (attempt + 1), 20)
+
+            st.warning(
+                f"Voice service temporarily busy ({error.code}). "
+                f"Retrying in {wait_seconds} seconds..."
+            )
+
+            time.sleep(wait_seconds)
+
+    raise RuntimeError(
+        "Voice transcription failed after retries."
     )
 
-    audio_data = None
 
-    if response.candidates:
-        for part in response.candidates[0].content.parts:
-            if part.inline_data and part.inline_data.data:
-                audio_data = part.inline_data.data
-                break
+# =========================================================
+# 6. VOICE OUTPUT: TEXT TO SPEECH
+# =========================================================
+
+@st.cache_data(show_spinner=False, max_entries=100)
+def text_to_speech(text):
+    """Generate and cache audio for each unique answer."""
+
+    if client is None:
+        raise ValueError(
+            "Check your GEMINI_API_KEY in .env."
+        )
+
+    interaction = client.interactions.create(
+        model=TTS_MODEL,
+        input=[
+            {
+                "type": "user_input",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": text[:4000],
+                        "annotations": [
+                            {
+                                "type": "speech_metadata",
+                                "style": (
+                                    "Speak naturally and clearly, "
+                                    "using the language of the text. "
+                                    "Do not translate it."
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+        response_format={"type": "audio"},
+        generation_config={
+            "speech_config": [{"voice": "Kore"}],
+        },
+    )
+
+    output_audio = getattr(
+        interaction, "output_audio", None
+    )
+
+    audio_data = (
+        getattr(output_audio, "data", None)
+        if output_audio
+        else None
+    )
 
     if not audio_data:
         raise ValueError("Gemini did not return audio.")
 
-    # Wrap raw PCM audio in a WAV container.
-    wav_buffer = io.BytesIO()
+    if isinstance(audio_data, str):
+        audio_bytes = base64.b64decode(audio_data)
+    else:
+        audio_bytes = bytes(audio_data)
 
-    with wave.open(wav_buffer, "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(24000)
-        wav_file.writeframes(audio_data)
+    if not audio_bytes:
+        raise ValueError("Gemini returned empty audio.")
 
-    return wav_buffer.getvalue()
+    return audio_bytes
 
 
+# =========================================================
 # 7. PDF PROCESSING
+# =========================================================
+
 def process_pdf(pdf_bytes):
+
     reader = PdfReader(io.BytesIO(pdf_bytes))
     text_parts = []
 
-    for page_number, page in enumerate(reader.pages, start=1):
+    for page_number, page in enumerate(
+        reader.pages,
+        start=1,
+    ):
         page_text = page.extract_text() or ""
 
         if page_text.strip():
@@ -191,7 +321,8 @@ def process_pdf(pdf_bytes):
 
     if not pdf_text:
         raise ValueError(
-            "No readable text found. Scanned PDFs may require OCR."
+            "No readable text found. "
+            "Scanned PDFs may require OCR."
         )
 
     chunk_size = 1000
@@ -217,7 +348,10 @@ def process_pdf(pdf_bytes):
         show_progress_bar=False,
     )
 
-    embeddings = np.asarray(embeddings, dtype=np.float32)
+    embeddings = np.asarray(
+        embeddings,
+        dtype=np.float32,
+    )
 
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
@@ -225,8 +359,12 @@ def process_pdf(pdf_bytes):
     return chunks, index, model
 
 
+# =========================================================
 # 8. PDF RETRIEVAL
+# =========================================================
+
 def retrieve_context(question, top_k=5):
+
     index = st.session_state.faiss_index
     chunks = st.session_state.chunks
     model = st.session_state.embedding_model
@@ -242,7 +380,8 @@ def retrieve_context(question, top_k=5):
     )
 
     query_embedding = np.asarray(
-        query_embedding, dtype=np.float32
+        query_embedding,
+        dtype=np.float32,
     )
 
     scores, indices = index.search(
@@ -259,23 +398,35 @@ def retrieve_context(question, top_k=5):
     return "\n\n".join(context_parts)
 
 
+# =========================================================
 # 9. CHAT HISTORY
+# =========================================================
+
 def build_history():
+
     history = st.session_state.messages[:-1][-10:]
     lines = []
 
     for message in history:
         role = (
-            "User" if message["role"] == "user"
+            "User"
+            if message["role"] == "user"
             else "Assistant"
         )
-        lines.append(f"{role}: {message['content']}")
+
+        lines.append(
+            f"{role}: {message['content']}"
+        )
 
     return "\n".join(lines)
 
 
+# =========================================================
 # 10. PROMPT CREATION
+# =========================================================
+
 def build_prompt(question, context=""):
+
     history = build_history()
 
     if st.session_state.active_mode == "PDF":
@@ -324,28 +475,184 @@ Give the answer as normal readable text.
 """
 
 
+# =========================================================
 # 11. NAVIGATION
+# =========================================================
+
 def go_home():
+
     st.session_state.active_mode = None
     st.rerun()
 
 
 def start_new_chat():
+
     st.session_state.messages = []
+    st.session_state.last_voice_hash = None
+    st.session_state.last_transcript = None
+    st.session_state.tts_audio = {}
+    st.session_state.tts_errors = {}
+    st.session_state.autoplay_audio_id = None
     st.rerun()
 
 
-# 12. HOME PAGE
-if st.session_state.active_mode is None:
-    st.title("🤖 Advanced RAG Chatbot")
+# =========================================================
+# 12. SHARED QUESTION HANDLER
+# =========================================================
 
-    st.write("Vanakkam bro! Welcome to your AI chatbot.")
-    st.write("Choose how you want to chat.")
+def submit_question(question):
+
+    question = (question or "").strip()
+
+    if not question:
+        return False
+
+    if client is None:
+        st.error(
+            "GEMINI_API_KEY-ai .env file-la check pannu."
+        )
+        return False
+
+    if (
+        st.session_state.active_mode == "PDF"
+        and not st.session_state.pdf_ready
+    ):
+        st.warning(
+            "First PDF upload panni process pannu."
+        )
+        return False
+
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": question,
+        }
+    )
+
+    try:
+        with st.spinner("Answer prepare pannudhu..."):
+
+            if st.session_state.active_mode == "PDF":
+                context = retrieve_context(question)
+
+                if not context.strip():
+                    answer = (
+                        "PDF-la readable text retrieve panna mudiyala. "
+                        "PDF-ai check panni try pannu."
+                    )
+                else:
+                    prompt = build_prompt(question, context)
+                    answer = ask_gemini_with_retry(prompt)
+
+            else:
+                prompt = build_prompt(question)
+                answer = ask_gemini_with_retry(prompt)
+
+        assistant_message = {
+            "role": "assistant",
+            "content": answer,
+        }
+
+        st.session_state.messages.append(
+            assistant_message
+        )
+
+        answer_id = hashlib.sha256(
+            answer.encode("utf-8")
+        ).hexdigest()[:20]
+
+        if answer_id not in st.session_state.tts_audio:
+            try:
+                with st.spinner(
+                    "Answer ready! Voice-um prepare pannudhu..."
+                ):
+                    audio_bytes = text_to_speech(answer)
+
+                st.session_state.tts_audio[answer_id] = audio_bytes
+                st.session_state.autoplay_audio_id = answer_id
+
+                st.session_state.tts_errors.pop(
+                    answer_id,
+                    None,
+                )
+
+            except Exception as voice_error:
+                st.session_state.tts_errors[answer_id] = (
+                    str(voice_error)
+                )
+
+        return True
+
+    except errors.APIError as error:
+
+        if (
+            st.session_state.messages
+            and st.session_state.messages[-1]["role"] == "user"
+        ):
+            st.session_state.messages.pop()
+
+        if error.code == 429:
+            st.error(
+                "Gemini API quota exceeded. "
+                "Check your API quota and try again later."
+            )
+
+        elif error.code in {401, 403}:
+            st.error(
+                "Gemini API authentication failed. "
+                "Check your API key and permissions."
+            )
+
+        elif error.code == 503:
+            st.error(
+                "Gemini server is still busy, bro. "
+                "Please wait a little and try again."
+            )
+
+        else:
+            st.error("Gemini API request failed.")
+            st.caption(str(error))
+
+        return False
+
+    except Exception as error:
+
+        if (
+            st.session_state.messages
+            and st.session_state.messages[-1]["role"] == "user"
+        ):
+            st.session_state.messages.pop()
+
+        st.error("Chat request fail aayiduchu.")
+        st.caption(str(error))
+
+        return False
+
+
+# =========================================================
+# 13. HOME PAGE
+# =========================================================
+
+if st.session_state.active_mode is None:
+
+    st.title("🤖 PDF Chat")
+
+    st.caption(
+        "Ask questions, understand documents, and chat naturally."
+    )
+
+    st.divider()
+
+    st.write(
+        "Vanakkam bro! Welcome to PDF Chat — "
+        "unga questions-ai kelunga, naan help panren!"
+    )
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("📄 PDF Mode")
+
         st.write(
             "Upload a PDF and ask questions about its content."
         )
@@ -360,6 +667,7 @@ if st.session_state.active_mode is None:
 
     with col2:
         st.subheader("🧠 General AI Mode")
+
         st.write(
             "Ask general questions without uploading a PDF."
         )
@@ -372,292 +680,342 @@ if st.session_state.active_mode is None:
             st.session_state.messages = []
             st.rerun()
 
-    st.caption("Tamil, Tanglish and English supported.")
+    st.caption(
+        "Tamil, Tanglish and English supported."
+    )
+
     st.stop()
 
 
-# 13. PDF UPLOAD
-if (
-    st.session_state.active_mode == "PDF"
-    and not st.session_state.pdf_ready
-):
-    st.title("📄 PDF Mode")
-    st.write("Upload your PDF to start chatting.")
+# =========================================================
+# 14. PDF UPLOAD — AUTOMATIC PROCESSING
+# =========================================================
 
-    uploaded_file = st.file_uploader(
-        "Choose a PDF file",
-        type=["pdf"],
-    )
+if st.session_state.active_mode == "PDF":
 
-    if st.button(
-        "Process PDF & Open Chat",
-        disabled=uploaded_file is None,
-        use_container_width=True,
-    ):
-        try:
+    if not st.session_state.pdf_ready:
+
+        st.markdown("## 📄 Upload your PDF")
+
+        st.caption(
+            "Select a document. Processing starts automatically. "
+            "No separate Process button is required."
+        )
+
+        st.divider()
+
+        uploaded_file = st.file_uploader(
+            "Choose a PDF file",
+            type=["pdf"],
+            key="pdf_upload_auto",
+        )
+
+        if uploaded_file is not None:
+
             pdf_bytes = uploaded_file.getvalue()
+
             current_hash = hashlib.sha256(
                 pdf_bytes
             ).hexdigest()
 
-            with st.spinner("PDF process pannudhu..."):
-                if (
-                    current_hash == st.session_state.pdf_hash
-                    and st.session_state.faiss_index is not None
-                ):
-                    st.session_state.pdf_name = uploaded_file.name
-                else:
-                    chunks, index, model = process_pdf(pdf_bytes)
+            if (
+                st.session_state.last_auto_pdf_hash
+                != current_hash
+            ):
+                try:
+                    with st.spinner(
+                        "PDF process pannudhu... Please wait."
+                    ):
 
-                    st.session_state.chunks = chunks
-                    st.session_state.faiss_index = index
-                    st.session_state.embedding_model = model
-                    st.session_state.pdf_hash = current_hash
-                    st.session_state.pdf_name = uploaded_file.name
+                        if (
+                            current_hash == st.session_state.pdf_hash
+                            and st.session_state.faiss_index is not None
+                        ):
+                            st.session_state.pdf_name = (
+                                uploaded_file.name
+                            )
 
-                st.session_state.messages = []
-                st.session_state.pdf_ready = True
+                        else:
+                            chunks, index, model = process_pdf(
+                                pdf_bytes
+                            )
 
-            st.success("PDF processed successfully!")
-            st.rerun()
+                            st.session_state.chunks = chunks
+                            st.session_state.faiss_index = index
+                            st.session_state.embedding_model = model
+                            st.session_state.pdf_hash = current_hash
+                            st.session_state.pdf_name = (
+                                uploaded_file.name
+                            )
 
-        except Exception as error:
-            st.error("PDF process panna mudiyala.")
-            st.caption(str(error))
+                        st.session_state.messages = []
+                        st.session_state.pdf_ready = True
+                        st.session_state.last_auto_pdf_hash = (
+                            current_hash
+                        )
 
-    if st.button("⬅️ Back to Home"):
-        go_home()
+                    st.success("PDF processed successfully!")
+                    st.rerun()
 
-    st.stop()
+                except Exception as error:
+                    st.error("PDF process panna mudiyala.")
+                    st.caption(str(error))
+
+        if st.button("⬅️ Back to Home"):
+            go_home()
+
+        st.stop()
 
 
-# 14. CHAT HEADER
+# =========================================================
+# 15. CHAT HEADER
+# =========================================================
+
 if st.session_state.active_mode == "PDF":
-    st.title("📄 PDF Chat")
-    st.caption(f"Document: {st.session_state.pdf_name}")
+
+    st.markdown("## 📄 PDF Chat")
+
+    st.caption(
+        f"Document: {st.session_state.pdf_name or 'Ready'}"
+    )
+
+    st.divider()
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        if st.button("⬅️ Home"):
+        if st.button("⬅️ Home", use_container_width=True):
             go_home()
 
     with col2:
-        if st.button("🔄 Change PDF"):
+        if st.button(
+            "🔄 Change PDF",
+            use_container_width=True,
+        ):
             st.session_state.pdf_ready = False
             st.session_state.messages = []
+            st.session_state.last_auto_pdf_hash = None
+            st.session_state.pdf_hash = None
+            st.session_state.pdf_name = None
+            st.session_state.chunks = []
+            st.session_state.faiss_index = None
+            st.session_state.embedding_model = None
             st.rerun()
 
     with col3:
-        if st.button("🗑️ New Chat"):
+        if st.button(
+            "🗑️ New Chat",
+            use_container_width=True,
+        ):
             start_new_chat()
 
 else:
-    st.title("🧠 General AI Chat")
+
+    st.markdown("## 🧠 General AI Chat")
+
     st.caption(
         "Ask questions in Tamil, Tanglish or English."
     )
 
+    st.divider()
+
     col1, col2 = st.columns(2)
 
     with col1:
-        if st.button("⬅️ Home"):
+        if st.button("⬅️ Home", use_container_width=True):
             go_home()
 
     with col2:
-        if st.button("🗑️ New Chat"):
+        if st.button(
+            "🗑️ New Chat",
+            use_container_width=True,
+        ):
             start_new_chat()
 
+st.caption(
+    "Answers appear as text. Voice is prepared automatically "
+    "when possible. Audio playback may require pressing Play."
+)
 
-# 15. VOICE SETTINGS
+
+# =========================================================
+# 16. DISPLAY CHAT HISTORY + AUDIO
+# =========================================================
+
+for message in st.session_state.messages:
+
+    with st.chat_message(message["role"]):
+
+        st.markdown(message["content"])
+
+        if message["role"] == "assistant":
+
+            answer_id = hashlib.sha256(
+                message["content"].encode("utf-8")
+            ).hexdigest()[:20]
+
+            audio_bytes = st.session_state.tts_audio.get(
+                answer_id
+            )
+
+            if audio_bytes:
+
+                should_autoplay = (
+                    st.session_state.get("autoplay_audio_id")
+                    == answer_id
+                )
+
+                st.audio(
+                    audio_bytes,
+                    format="audio/wav",
+                    autoplay=should_autoplay,
+                )
+
+                if should_autoplay:
+                    st.session_state.autoplay_audio_id = None
+
+            else:
+                voice_error = st.session_state.tts_errors.get(
+                    answer_id
+                )
+
+                if voice_error:
+                    st.caption(
+                        "Voice could not be prepared. "
+                        "The text answer is still available."
+                    )
+                else:
+                    st.caption(
+                        "Voice is not available for this answer yet."
+                    )
+
+
+# =========================================================
+# 17. CHAT INPUT: TEXT + MICROPHONE + SEND
+# =========================================================
+
 st.divider()
 
 st.caption(
-    "Answers appear as text. Click 🔊 Listen below an answer "
-    "to hear it in voice."
+    "Type a question or press 🎙️ to record. "
+    "Stop recording to submit your voice question."
 )
 
-st.caption(
-    "Use the microphone to speak, or type your question below."
+text_col, mic_col, send_col = st.columns(
+    [12, 1, 1],
+    vertical_alignment="bottom",
 )
 
+with text_col:
 
-# 16. VOICE INPUT
-st.subheader("🎤 Voice Input")
+    typed_question = st.text_input(
+        "Message",
+        placeholder=(
+            "Ask something about your PDF..."
+            if st.session_state.active_mode == "PDF"
+            else "Ask me anything..."
+        ),
+        label_visibility="collapsed",
+        key="chat_message_input",
+    )
 
-audio_value = st.audio_input(
-    "Record your question in Tamil, Tanglish or English",
-    key="voice_question",
-)
+with mic_col:
 
-voice_button = st.button(
-    "🎙️ Transcribe Voice & Ask",
-    use_container_width=True,
-    key="transcribe_and_ask",
-)
+    voice_result = mic_recorder(
+        start_prompt="🎙️",
+        stop_prompt="⏹️",
+        just_once=True,
+        use_container_width=True,
+        format="wav",
+        key="chat_mic_recorder",
+    )
 
-voice_question = None
+with send_col:
 
-if voice_button:
-    if audio_value is None:
-        st.warning(
-            "First microphone use panni question record pannu."
-        )
-    else:
+    send_text = st.button(
+        "➤",
+        help="Send message",
+        use_container_width=True,
+        key="chat_send_button",
+    )
+
+
+# =========================================================
+# 18. HANDLE TYPED QUESTION
+# =========================================================
+
+if send_text and typed_question.strip():
+
+    submitted = submit_question(typed_question)
+
+    if submitted:
+        st.rerun()
+
+
+# =========================================================
+# 19. HANDLE VOICE QUESTION AUTOMATICALLY
+# =========================================================
+
+if voice_result and voice_result.get("bytes"):
+
+    voice_bytes = voice_result["bytes"]
+
+    voice_hash = hashlib.sha256(
+        voice_bytes
+    ).hexdigest()
+
+    if st.session_state.last_voice_hash != voice_hash:
+
+        st.session_state.last_voice_hash = voice_hash
+
         try:
-            with st.spinner("Voice-ai text-ah convert pannudhu..."):
+            with st.spinner(
+                "Voice-ai text-ah convert panni answer prepare pannudhu..."
+            ):
+
                 voice_question = transcribe_audio(
-                    audio_value.getvalue(),
-                    audio_value.type or "audio/wav",
+                    voice_bytes,
+                    "audio/wav",
                 )
 
-            st.success("Voice converted to text!")
-            st.write("**Your question:**")
-            st.write(voice_question)
+                st.session_state.last_transcript = voice_question
+
+                st.info(
+                    f"🎤 You said: {voice_question}"
+                )
+
+                submitted = submit_question(
+                    voice_question
+                )
+
+            if submitted:
+                st.rerun()
 
         except errors.APIError as error:
-            st.error("Voice transcription API request failed.")
+
+            st.error(
+                "Voice transcription API request failed."
+            )
 
             if error.code == 429:
                 st.warning(
                     "API quota/rate limit exceeded. "
                     "Try again later or check your Gemini API quota."
                 )
+
+            elif error.code == 503:
+                st.warning(
+                    "Gemini server is busy. "
+                    "Please record again after a short wait."
+                )
+
             else:
                 st.caption(str(error))
 
         except Exception as error:
-            st.error("Voice-ai text-ah convert panna mudiyala.")
-            st.caption(str(error))
 
-
-# 17. DISPLAY EXISTING CHAT + SPEAKER BUTTON
-st.divider()
-st.subheader("💬 Chat")
-
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-        # Show speaker button only for AI answers.
-        # Audio is generated only when the button is clicked.
-        if message["role"] == "assistant":
-            answer = message["content"]
-
-            answer_id = hashlib.sha256(
-                answer.encode("utf-8")
-            ).hexdigest()[:16]
-
-            audio_key = f"tts_audio_{answer_id}"
-
-            if st.button(
-                "🔊 Listen",
-                key=f"listen_{answer_id}",
-            ):
-                try:
-                    with st.spinner("Generating voice..."):
-                        audio_bytes = text_to_speech(answer)
-
-                    st.session_state[audio_key] = audio_bytes
-
-                except Exception as error:
-                    st.error("Voice output failed.")
-                    st.caption(str(error))
-
-            # Display audio player only after clicking Listen.
-            if audio_key in st.session_state:
-                st.audio(
-                    st.session_state[audio_key],
-                    format="audio/wav",
-                )
-
-
-# 18. TEXT INPUT OR VOICE QUESTION
-typed_question = st.chat_input("Un question-ah kelu...")
-
-# A newly transcribed voice question takes priority on that run.
-question = voice_question or typed_question
-
-if question:
-    if client is None:
-        st.error("GEMINI_API_KEY-ai .env file-la check pannu.")
-        st.stop()
-
-    if (
-        st.session_state.active_mode == "PDF"
-        and not st.session_state.pdf_ready
-    ):
-        st.warning("First PDF upload panni process pannu.")
-        st.stop()
-
-    st.session_state.messages.append({
-        "role": "user",
-        "content": question,
-    })
-
-    with st.chat_message("user"):
-        st.markdown(question)
-
-    try:
-        with st.chat_message("assistant"):
-            with st.spinner("Answer prepare pannudhu..."):
-
-                if st.session_state.active_mode == "PDF":
-                    context = retrieve_context(question)
-
-                    if not context.strip():
-                        answer = (
-                            "PDF-la readable text retrieve panna mudiyala. "
-                            "PDF-ai check panni try pannu."
-                        )
-                    else:
-                        prompt = build_prompt(question, context)
-                        answer = ask_gemini_with_retry(prompt)
-
-                else:
-                    prompt = build_prompt(question)
-                    answer = ask_gemini_with_retry(prompt)
-
-            # Show text answer first. No automatic voice generation.
-            st.markdown(answer)
-
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": answer,
-        })
-
-        # Rerun to display the Listen button below the saved answer.
-        st.rerun()
-
-    except errors.APIError as error:
-        if (
-            st.session_state.messages
-            and st.session_state.messages[-1]["role"] == "user"
-            and st.session_state.messages[-1]["content"] == question
-        ):
-            st.session_state.messages.pop()
-
-        if error.code == 429:
             st.error(
-                "Gemini API quota exceeded. Check your API quota "
-                "and try again later."
+                "Voice-ai text-ah convert panna mudiyala."
             )
-        elif error.code in {401, 403}:
-            st.error(
-                "Gemini API authentication failed. "
-                "Check your API key and permissions."
-            )
-        else:
-            st.error("Gemini API request failed.")
+
             st.caption(str(error))
-
-    except Exception as error:
-        if (
-            st.session_state.messages
-            and st.session_state.messages[-1]["role"] == "user"
-            and st.session_state.messages[-1]["content"] == question
-        ):
-            st.session_state.messages.pop()
-
-        st.error("Chat request fail aayiduchu.")
-        st.caption(str(error))
